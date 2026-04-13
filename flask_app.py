@@ -1,6 +1,5 @@
 import os
-import json
-import tempfile
+import hashlib
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -10,6 +9,14 @@ CORS(app)
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# ── In-memory stores ────────────────────────────────────────
+# doc_id -> list of text chunks
+doc_chunks: dict = {}
+# (doc_id, provider, key_hash) -> FAISS vectorstore
+vector_stores: dict = {}
+
+
+# ── PDF helpers ─────────────────────────────────────────────
 
 def extract_text_from_pdf(file_path: str) -> str:
     import pdfplumber
@@ -22,75 +29,160 @@ def extract_text_from_pdf(file_path: str) -> str:
     return text.strip()
 
 
-def get_openai_answer(question: str, context: str, api_key: str) -> str:
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key)
+def count_pages(file_path: str) -> int:
+    try:
+        import pdfplumber
+        with pdfplumber.open(file_path) as pdf:
+            return len(pdf.pages)
+    except Exception:
+        return 0
 
-    system_prompt = (
-        "You are a helpful assistant that answers questions based on provided document content. "
-        "Use ONLY the document content to answer. If the answer is not in the document, say so clearly. "
-        "Be concise and accurate."
+
+def split_into_chunks(text: str, chunk_size: int = 1000, chunk_overlap: int = 150) -> list:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", ". ", " ", ""],
     )
-    user_prompt = f"Document content:\n{context[:12000]}\n\nQuestion: {question}"
-
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        max_tokens=1000,
-        temperature=0.3,
-    )
-    return response.choices[0].message.content.strip()
+    return splitter.split_text(text)
 
 
-def get_gemini_answer(question: str, context: str, api_key: str) -> str:
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+# ── Embedding & vectorstore ─────────────────────────────────
 
-    prompt = (
-        "You are a helpful assistant that answers questions based on provided document content. "
-        "Use ONLY the document content to answer. If the answer is not in the document, say so clearly.\n\n"
-        f"Document content:\n{context[:12000]}\n\nQuestion: {question}"
-    )
-    response = model.generate_content(prompt)
-    return response.text.strip()
+def _store_key(doc_id: str, provider: str, api_key: str) -> str:
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:12]
+    return f"{doc_id}::{provider}::{key_hash}"
 
 
-def get_openai_summary(context: str, api_key: str) -> str:
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key)
-
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a helpful assistant. Provide a clear, concise summary of the following document.",
-            },
-            {"role": "user", "content": f"Summarize this document:\n{context[:10000]}"},
-        ],
-        max_tokens=600,
-        temperature=0.4,
-    )
-    return response.choices[0].message.content.strip()
+def get_embeddings(provider: str, api_key: str):
+    if provider == "openai":
+        from langchain_openai import OpenAIEmbeddings
+        return OpenAIEmbeddings(openai_api_key=api_key)
+    elif provider == "gemini":
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+        return GoogleGenerativeAIEmbeddings(
+            model="models/embedding-001",
+            google_api_key=api_key,
+        )
+    raise ValueError(f"Unknown provider: {provider}")
 
 
-def get_gemini_summary(context: str, api_key: str) -> str:
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+def get_or_build_vectorstore(doc_id: str, provider: str, api_key: str):
+    """Return cached FAISS store or build it from stored chunks."""
+    from langchain_community.vectorstores import FAISS
 
-    prompt = f"Provide a clear, concise summary of the following document:\n{context[:10000]}"
-    response = model.generate_content(prompt)
-    return response.text.strip()
+    skey = _store_key(doc_id, provider, api_key)
+    if skey in vector_stores:
+        return vector_stores[skey], False
 
+    if doc_id not in doc_chunks:
+        raise ValueError("Document not found. Please re-upload the PDF.")
+
+    chunks = doc_chunks[doc_id]
+    embeddings = get_embeddings(provider, api_key)
+    store = FAISS.from_texts(chunks, embeddings)
+    vector_stores[skey] = store
+    return store, True
+
+
+# ── LLM helpers ─────────────────────────────────────────────
+
+def get_llm(provider: str, api_key: str):
+    if provider == "openai":
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(model="gpt-3.5-turbo", openai_api_key=api_key, temperature=0.3, max_tokens=1200)
+    elif provider == "gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key, temperature=0.3)
+    raise ValueError(f"Unknown provider: {provider}")
+
+
+# ── RAG chain ────────────────────────────────────────────────
+
+RAG_SYSTEM_PROMPT = """You are a precise document assistant. Your task is to answer the user's question using ONLY the document excerpts provided below.
+
+Rules:
+1. Base your answer STRICTLY on the provided excerpts — do not use any outside knowledge.
+2. If the answer is NOT found in the excerpts, respond with: "This information is not found in the uploaded document."
+3. Quote relevant sections where helpful.
+4. Be concise and clear.
+
+Document excerpts:
+---
+{context}
+---"""
+
+
+def rag_answer(doc_id: str, question: str, provider: str, api_key: str, top_k: int = 5) -> dict:
+    store, built = get_or_build_vectorstore(doc_id, provider, api_key)
+
+    docs = store.similarity_search_with_score(question, k=top_k)
+    if not docs:
+        return {"answer": "No relevant content found in the document.", "sources": [], "chunks_built": built}
+
+    context_parts = []
+    sources = []
+    for i, (doc, score) in enumerate(docs):
+        context_parts.append(f"[Excerpt {i+1}]\n{doc.page_content}")
+        sources.append({
+            "excerpt": doc.page_content[:300] + ("…" if len(doc.page_content) > 300 else ""),
+            "relevance_score": round(float(score), 4),
+        })
+
+    context = "\n\n".join(context_parts)
+    prompt = RAG_SYSTEM_PROMPT.format(context=context) + f"\n\nQuestion: {question}\n\nAnswer:"
+
+    llm = get_llm(provider, api_key)
+    from langchain_core.messages import HumanMessage
+    response = llm.invoke([HumanMessage(content=prompt)])
+    answer = response.content.strip()
+
+    return {"answer": answer, "sources": sources, "chunks_built": built}
+
+
+# ── Summarization ────────────────────────────────────────────
+
+SUMMARY_PROMPT = """You are an expert summarizer. Read the following document content and write a clear, structured summary that captures:
+- The main topic and purpose
+- Key findings, arguments, or points
+- Any conclusions or recommendations
+
+Be thorough but concise. Use plain language.
+
+Document content:
+{text}
+
+Summary:"""
+
+
+def summarize_doc(doc_id: str, provider: str, api_key: str) -> str:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from langchain.chains.summarize import load_summarize_chain
+    from langchain_core.documents import Document
+
+    if doc_id not in doc_chunks:
+        raise ValueError("Document not found. Please re-upload the PDF.")
+
+    chunks = doc_chunks[doc_id]
+    llm = get_llm(provider, api_key)
+
+    lc_docs = [Document(page_content=chunk) for chunk in chunks]
+
+    if len(lc_docs) <= 6:
+        chain = load_summarize_chain(llm, chain_type="stuff")
+    else:
+        chain = load_summarize_chain(llm, chain_type="map_reduce")
+
+    result = chain.invoke(lc_docs)
+    return result.get("output_text", "").strip()
+
+
+# ── Routes ───────────────────────────────────────────────────
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "docs_loaded": len(doc_chunks), "stores_cached": len(vector_stores)})
 
 
 @app.route("/api/process-pdf", methods=["POST"])
@@ -99,40 +191,39 @@ def process_pdf():
         return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files["file"]
-    if file.filename == "":
-        return jsonify({"error": "No file selected"}), 400
-
-    if not file.filename.lower().endswith(".pdf"):
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
         return jsonify({"error": "Only PDF files are supported"}), 400
 
-    save_path = os.path.join(UPLOAD_FOLDER, file.filename)
-    file.save(save_path)
+    file_bytes = file.read()
+    doc_id = hashlib.md5(file.filename.encode() + file_bytes[:512]).hexdigest()[:16]
+
+    save_path = os.path.join(UPLOAD_FOLDER, f"{doc_id}_{file.filename}")
+    with open(save_path, "wb") as f:
+        f.write(file_bytes)
 
     try:
-        text = extract_text_from_pdf(save_path)
-        word_count = len(text.split())
-        char_count = len(text)
-        page_count = _count_pages(save_path)
+        raw_text = extract_text_from_pdf(save_path)
+        if not raw_text.strip():
+            return jsonify({"error": "Could not extract text from this PDF. It may be image-based or password-protected."}), 400
+
+        chunks = split_into_chunks(raw_text)
+        doc_chunks[doc_id] = chunks
+
+        page_count = count_pages(save_path)
+        word_count = len(raw_text.split())
+        char_count = len(raw_text)
 
         return jsonify({
             "success": True,
+            "doc_id": doc_id,
             "filename": file.filename,
-            "text": text,
+            "page_count": page_count,
             "word_count": word_count,
             "char_count": char_count,
-            "page_count": page_count,
+            "chunk_count": len(chunks),
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
-def _count_pages(file_path: str) -> int:
-    try:
-        import pdfplumber
-        with pdfplumber.open(file_path) as pdf:
-            return len(pdf.pages)
-    except Exception:
-        return 0
 
 
 @app.route("/api/chat", methods=["POST"])
@@ -142,26 +233,22 @@ def chat():
         return jsonify({"error": "No data provided"}), 400
 
     question = data.get("question", "").strip()
-    context = data.get("context", "").strip()
+    doc_id = data.get("doc_id", "").strip()
     api_key = data.get("api_key", "").strip()
     provider = data.get("provider", "openai").lower()
 
     if not question:
         return jsonify({"error": "Question is required"}), 400
-    if not context:
-        return jsonify({"error": "No document context provided"}), 400
+    if not doc_id:
+        return jsonify({"error": "Document ID is required"}), 400
     if not api_key:
         return jsonify({"error": "API key is required"}), 400
+    if provider not in ("openai", "gemini"):
+        return jsonify({"error": f"Unknown provider: {provider}"}), 400
 
     try:
-        if provider == "openai":
-            answer = get_openai_answer(question, context, api_key)
-        elif provider == "gemini":
-            answer = get_gemini_answer(question, context, api_key)
-        else:
-            return jsonify({"error": f"Unknown provider: {provider}"}), 400
-
-        return jsonify({"answer": answer})
+        result = rag_answer(doc_id, question, provider, api_key)
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -172,23 +259,19 @@ def summarize():
     if not data:
         return jsonify({"error": "No data provided"}), 400
 
-    context = data.get("context", "").strip()
+    doc_id = data.get("doc_id", "").strip()
     api_key = data.get("api_key", "").strip()
     provider = data.get("provider", "openai").lower()
 
-    if not context:
-        return jsonify({"error": "No document context provided"}), 400
+    if not doc_id:
+        return jsonify({"error": "Document ID is required"}), 400
     if not api_key:
         return jsonify({"error": "API key is required"}), 400
+    if provider not in ("openai", "gemini"):
+        return jsonify({"error": f"Unknown provider: {provider}"}), 400
 
     try:
-        if provider == "openai":
-            summary = get_openai_summary(context, api_key)
-        elif provider == "gemini":
-            summary = get_gemini_summary(context, api_key)
-        else:
-            return jsonify({"error": f"Unknown provider: {provider}"}), 400
-
+        summary = summarize_doc(doc_id, provider, api_key)
         return jsonify({"summary": summary})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
