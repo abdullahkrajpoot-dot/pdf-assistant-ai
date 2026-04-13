@@ -35,10 +35,18 @@ A full-stack PDF intelligence app built with Streamlit (frontend) and Flask (bac
 - **Gemini** (Gemini 1.5 Flash): requires an API key from aistudio.google.com
 
 ### API Endpoints
-- `GET /api/health` — Health check
-- `POST /api/process-pdf` — Upload and extract text from PDF
-- `POST /api/chat` — Ask a question about the document
-- `POST /api/summarize` — Generate a document summary
+- `GET /api/health` — Health check (reports loaded docs & cached stores)
+- `POST /api/process-pdf` — Upload PDF, extract text, split into RAG chunks → returns `doc_id`
+- `POST /api/chat` — RAG chat: FAISS similarity search → grounded LLM answer + source excerpts
+- `POST /api/summarize` — Map-reduce or stuffing summarization of all document chunks
+- `POST /api/translate` — Translate any text to Urdu (or other language) via the selected LLM
+
+### Portfolio Features
+- **Urdu Translation**: one-click AI translation of the summary with RTL rendering
+- **Download Chat Highlights**: exports full Q&A conversation as a `.txt` file
+- **Download Summary**: exports English-only or bilingual English + Urdu `.txt` file
+- **RAG Pipeline tab**: visual explanation of the full retrieval-augmented generation flow
+- **Responsive layout**: works on narrow screens via CSS media queries
 
 ## Key Commands
 

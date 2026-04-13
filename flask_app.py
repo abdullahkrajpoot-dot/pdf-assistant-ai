@@ -277,5 +277,38 @@ def summarize():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/translate", methods=["POST"])
+def translate():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    text = data.get("text", "").strip()
+    api_key = data.get("api_key", "").strip()
+    provider = data.get("provider", "openai").lower()
+    target_lang = data.get("target_lang", "Urdu")
+
+    if not text:
+        return jsonify({"error": "Text is required"}), 400
+    if not api_key:
+        return jsonify({"error": "API key is required"}), 400
+    if provider not in ("openai", "gemini"):
+        return jsonify({"error": f"Unknown provider: {provider}"}), 400
+
+    try:
+        prompt = (
+            f"Translate the following text into {target_lang}. "
+            f"Produce only the translated text — no explanations, no notes, no original text.\n\n"
+            f"{text}"
+        )
+        llm = get_llm(provider, api_key)
+        from langchain_core.messages import HumanMessage
+        response = llm.invoke([HumanMessage(content=prompt)])
+        translated = response.content.strip()
+        return jsonify({"translated": translated, "target_lang": target_lang})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=False)
