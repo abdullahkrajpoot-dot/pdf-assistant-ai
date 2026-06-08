@@ -1,7 +1,10 @@
 """Compatibility entrypoint for Streamlit Cloud.
 
 The real app lives in streamlit_app.py. Some deployments are configured to
-launch main.py, so importing streamlit_app keeps both entrypoints working.
+launch main.py, so this delegates to the production Streamlit app.
 """
 
-import streamlit_app  # noqa: F401
+from streamlit_app import main
+
+
+main()
