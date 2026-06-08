@@ -324,6 +324,14 @@ def init_session():
 
 init_session()
 
+
+def get_secret_api_key(provider_name: str) -> str:
+    secret_name = "OPENAI_API_KEY" if provider_name == "OpenAI" else "GEMINI_API_KEY"
+    try:
+        return st.secrets.get(secret_name, "")
+    except Exception:
+        return os.environ.get(secret_name, "")
+
 # ─────────────────────── SIDEBAR ────────────────────────────
 with st.sidebar:
     st.markdown("""
@@ -341,18 +349,23 @@ with st.sidebar:
     provider = st.selectbox("Provider", ["OpenAI", "Gemini"], index=0 if st.session_state.provider == "OpenAI" else 1, label_visibility="collapsed")
     if provider != st.session_state.provider:
         st.session_state.provider = provider
+        st.session_state.api_key = ""
 
     # API Key
     st.markdown("<div class='sidebar-label' style='margin-top:1rem;'>🔑 API Key</div>", unsafe_allow_html=True)
+    secret_api_key = get_secret_api_key(provider)
+    default_api_key = st.session_state.api_key or secret_api_key
     api_key_input = st.text_input(
         "API Key",
-        value=st.session_state.api_key,
+        value=default_api_key,
         type="password",
         placeholder="sk-..." if provider == "OpenAI" else "AIza...",
         label_visibility="collapsed",
     )
     st.session_state.api_key = api_key_input
-    if api_key_input:
+    if secret_api_key:
+        st.markdown("<span class='status-ok'>â— Key loaded from secrets</span>", unsafe_allow_html=True)
+    elif api_key_input:
         st.markdown("<span class='status-ok'>● Key configured</span>", unsafe_allow_html=True)
     else:
         st.markdown("<span class='status-idle'>○ No key set</span>", unsafe_allow_html=True)

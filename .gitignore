@@ -56,3 +56,6 @@ Thumbs.db
 
 # Runtime uploads
 uploads/
+
+# Local Streamlit secrets
+.streamlit/secrets.toml
