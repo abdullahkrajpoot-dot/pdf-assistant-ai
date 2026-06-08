@@ -1,6 +1,7 @@
-def main():
-    print("Hello from repl-nix-workspace!")
+"""Compatibility entrypoint for Streamlit Cloud.
 
+The real app lives in streamlit_app.py. Some deployments are configured to
+launch main.py, so importing streamlit_app keeps both entrypoints working.
+"""
 
-if __name__ == "__main__":
-    main()
+import streamlit_app  # noqa: F401
