@@ -17,7 +17,11 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import streamlit as st
-from pypdf import PdfReader
+
+try:
+    from pypdf import PdfReader
+except ModuleNotFoundError:
+    from PyPDF2 import PdfReader
 
 
 APP_TITLE = "PDF Summarizer Agent"
