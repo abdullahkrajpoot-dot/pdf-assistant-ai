@@ -1,25 +1,35 @@
 """Streamlit Cloud-ready PDF Summarizer Agent.
 
-This single-file app parses uploaded PDFs with pypdf and uses Gemini through
-google-generativeai for executive summaries and contextual chat.
+This single-file app parses uploaded PDFs with pypdf and uses OpenRouter for
+executive summaries and contextual chat.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-import google.generativeai as genai
 import streamlit as st
 from pypdf import PdfReader
 
 
 APP_TITLE = "PDF Summarizer Agent"
-GEMINI_MODEL = "gemini-1.5-flash"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "openai/gpt-4o-mini"
 MAX_CONTEXT_CHARS = 140_000
+
+
+def render_html(markup: str) -> None:
+    """Render trusted app-owned HTML/CSS snippets."""
+
+    st.markdown(markup, unsafe_allow_html=True)
 
 
 @dataclass(frozen=True)
@@ -53,7 +63,7 @@ def init_state() -> None:
 def inject_css() -> None:
     """Add a restrained production UI layer over native Streamlit widgets."""
 
-    st.markdown(
+    render_html(
         """
         <style>
             :root {
@@ -61,6 +71,11 @@ def inject_css() -> None:
                 --muted: #6B7280;
                 --line: #E5E7EB;
                 --panel: #F8FAFC;
+                --sidebar-bg: #080B12;
+                --sidebar-panel: #111827;
+                --sidebar-line: #263244;
+                --sidebar-text: #E5E7EB;
+                --sidebar-muted: #9CA3AF;
                 --indigo: #4F46E5;
                 --blue: #2563EB;
                 --success-bg: #ECFDF5;
@@ -71,13 +86,39 @@ def inject_css() -> None:
 
             .main .block-container {
                 max-width: 1180px;
-                padding-top: 1.25rem;
+                padding-top: 2rem;
                 padding-bottom: 2.5rem;
             }
 
             [data-testid="stSidebar"] {
-                background: #F8FAFC;
-                border-right: 1px solid var(--line);
+                background: var(--sidebar-bg);
+                border-right: 1px solid var(--sidebar-line);
+            }
+
+            [data-testid="stSidebar"] * {
+                color: var(--sidebar-text);
+            }
+
+            [data-testid="stSidebar"] [data-testid="stFileUploader"] {
+                background: var(--sidebar-panel);
+                border: 1px solid var(--sidebar-line);
+                border-radius: 8px;
+                padding: 0.75rem;
+            }
+
+            [data-testid="stSidebar"] [data-testid="stFileUploader"] section {
+                background: var(--sidebar-panel);
+                border-color: var(--sidebar-line);
+            }
+
+            [data-testid="stSidebar"] [data-testid="stAlert"] {
+                background: #3A3212;
+                border: 1px solid #645718;
+                border-radius: 8px;
+            }
+
+            [data-testid="stSidebar"] [data-testid="stAlert"] * {
+                color: #FEF3C7;
             }
 
             h1, h2, h3 {
@@ -104,7 +145,7 @@ def inject_css() -> None:
                 color: var(--ink);
                 font-size: 2.1rem;
                 font-weight: 800;
-                line-height: 1.15;
+                line-height: 1.25;
                 margin: 0;
             }
 
@@ -205,7 +246,7 @@ def inject_css() -> None:
             }
 
             .sidebar-note {
-                color: var(--muted);
+                color: var(--sidebar-muted);
                 font-size: 0.88rem;
                 line-height: 1.55;
             }
@@ -219,33 +260,21 @@ def inject_css() -> None:
                 }
             }
         </style>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
-def get_gemini_api_key() -> str | None:
-    """Read the Gemini key from Streamlit secrets without exposing it."""
+def get_openrouter_api_key() -> str | None:
+    """Read the OpenRouter key from environment or Streamlit secrets."""
 
+    env_key = os.getenv("OPENROUTER_API_KEY")
+    if env_key and env_key.strip():
+        return env_key.strip()
     try:
-        key = st.secrets["GEMINI_API_KEY"]
+        key = st.secrets["OPENROUTER_API_KEY"]
     except Exception:
         return None
     return str(key).strip() or None
-
-
-def configure_gemini(api_key: str) -> genai.GenerativeModel:
-    """Configure and return the Gemini model used by the app."""
-
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel(
-        GEMINI_MODEL,
-        generation_config={
-            "temperature": 0.2,
-            "top_p": 0.9,
-            "max_output_tokens": 4096,
-        },
-    )
 
 
 def fingerprint_file(filename: str, file_bytes: bytes) -> str:
@@ -325,34 +354,80 @@ def trim_context(text: str, max_chars: int = MAX_CONTEXT_CHARS) -> str:
     return f"{head}\n\n[Middle of document omitted for length]\n\n{tail}"
 
 
-def response_text(response: Any) -> str:
-    """Safely unwrap Gemini response text."""
+def friendly_openrouter_error(status_code: int | None, error_text: str) -> str:
+    """Convert noisy OpenRouter API errors into clear UI messages."""
 
-    text = getattr(response, "text", None)
-    if text:
-        return str(text).strip()
+    lower_error = error_text.lower()
 
-    parts: list[str] = []
-    for candidate in getattr(response, "candidates", []) or []:
-        content = getattr(candidate, "content", None)
-        for part in getattr(content, "parts", []) or []:
-            part_text = getattr(part, "text", "")
-            if part_text:
-                parts.append(part_text)
+    if status_code == 401 or "api key" in lower_error or "unauthorized" in lower_error:
+        return (
+            "OpenRouter rejected the API key. Check `OPENROUTER_API_KEY` in "
+            "`.streamlit/secrets.toml`, then restart Streamlit."
+        )
 
-    if parts:
-        return "\n".join(parts).strip()
-    raise RuntimeError("Gemini returned an empty response. Try again with a smaller PDF or simpler question.")
+    if status_code == 402 or "credits" in lower_error or "balance" in lower_error:
+        return (
+            "OpenRouter does not have enough credits for this request. Add credits in OpenRouter "
+            "or use a key with available balance."
+        )
+
+    if status_code == 429 or "rate limit" in lower_error:
+        return "OpenRouter rate limit was reached. Wait a bit, then retry the summary."
+
+    if status_code == 404 or ("model" in lower_error and "not" in lower_error):
+        return f"The selected OpenRouter model `{OPENROUTER_MODEL}` is unavailable for this key."
+
+    return f"OpenRouter request failed: {error_text}"
 
 
-def call_gemini(model: genai.GenerativeModel, prompt: str) -> str:
-    """Call Gemini and return text while hiding implementation errors from users."""
+def call_openrouter(api_key: str, prompt: str) -> str:
+    """Call OpenRouter and return the assistant text."""
+
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a careful PDF analysis assistant. Use only the provided document text.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "max_tokens": 4096,
+    }
+    request = Request(
+        OPENROUTER_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:5000",
+            "X-Title": APP_TITLE,
+        },
+        method="POST",
+    )
 
     try:
-        response = model.generate_content(prompt)
-        return response_text(response)
+        with urlopen(request, timeout=90) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        error_text = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(friendly_openrouter_error(exc.code, error_text)) from exc
+    except URLError as exc:
+        raise RuntimeError(f"Could not reach OpenRouter: {exc.reason}") from exc
     except Exception as exc:
-        raise RuntimeError(f"Gemini request failed: {exc}") from exc
+        raise RuntimeError(f"OpenRouter request failed: {exc}") from exc
+
+    try:
+        text = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("OpenRouter returned an empty response. Try again with a smaller PDF.") from exc
+
+    text = str(text).strip()
+    if not text:
+        raise RuntimeError("OpenRouter returned an empty response. Try again with a smaller PDF.")
+    return text
 
 
 def build_summary_prompt(document: PdfDocument) -> str:
@@ -437,25 +512,24 @@ def reset_document_state(document: PdfDocument) -> None:
 def render_header() -> None:
     """Render the main app header."""
 
-    st.markdown(
+    render_html(
         """
         <div class="app-shell">
-            <div class="app-kicker">Gemini PDF Intelligence</div>
+            <div class="app-kicker">OpenRouter PDF Intelligence</div>
             <h1 class="app-title">PDF Summarizer Agent</h1>
             <div class="app-subtitle">
                 Upload a PDF, get a structured executive summary, then ask follow-up
                 questions in a grounded chat workspace.
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
 def render_metrics(document: PdfDocument) -> None:
     """Render compact document metrics."""
 
-    st.markdown(
+    render_html(
         f"""
         <div class="metric-grid">
             <div class="metric-card">
@@ -475,22 +549,20 @@ def render_metrics(document: PdfDocument) -> None:
                 <div class="metric-label">Characters</div>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
 def render_empty_state() -> None:
     """Render the main empty state."""
 
-    st.markdown(
+    render_html(
         """
         <div class="empty-panel">
             <strong>Please upload a PDF file from the sidebar to begin analysis</strong>
             The executive summary and chat agent will appear here after the document is parsed.
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -499,22 +571,22 @@ def render_sidebar(api_key: str | None) -> None:
 
     with st.sidebar:
         st.markdown("## PDF Agent")
-        st.markdown(
+        render_html(
             """
             <div class="sidebar-note">
                 Generate boardroom-ready summaries and ask contextual questions about
                 contracts, reports, research papers, proposals, and policy documents.
             </div>
-            """,
-            unsafe_allow_html=True,
+            """
         )
 
         st.divider()
         if api_key:
-            st.markdown('<span class="status-badge status-ready">Gemini key loaded</span>', unsafe_allow_html=True)
+            render_html('<span class="status-badge status-ready">OpenRouter key loaded</span>')
         else:
             st.warning(
-                "Missing `GEMINI_API_KEY`. Add it in Streamlit Cloud: "
+                "Missing `OPENROUTER_API_KEY`. For local development, add it to "
+                "`.streamlit/secrets.toml`. In Streamlit Cloud, add it under "
                 "Manage app -> Settings -> Secrets."
             )
 
@@ -532,20 +604,17 @@ def render_sidebar(api_key: str | None) -> None:
                     reset_document_state(document)
                     st.success("Ready for Analysis")
                 else:
-                    st.markdown(
-                        '<span class="status-badge status-ready">Ready for Analysis</span>',
-                        unsafe_allow_html=True,
-                    )
+                    render_html('<span class="status-badge status-ready">Ready for Analysis</span>')
             except Exception as exc:
                 st.session_state.document = None
                 st.session_state.summary = ""
                 st.session_state.messages = []
                 st.error(str(exc))
         else:
-            st.markdown('<span class="status-badge status-idle">Waiting for PDF</span>', unsafe_allow_html=True)
+            render_html('<span class="status-badge status-idle">Waiting for PDF</span>')
 
 
-def render_summary_tab(model: genai.GenerativeModel | None, document: PdfDocument | None) -> None:
+def render_summary_tab(api_key: str | None, document: PdfDocument | None) -> None:
     """Render the executive summary tab."""
 
     if document is None:
@@ -554,14 +623,14 @@ def render_summary_tab(model: genai.GenerativeModel | None, document: PdfDocumen
 
     render_metrics(document)
 
-    if model is None:
-        st.warning("Add `GEMINI_API_KEY` in Streamlit secrets to generate the executive summary.")
+    if api_key is None:
+        st.warning("Add `OPENROUTER_API_KEY` in Streamlit secrets to generate the executive summary.")
         return
 
     if not st.session_state.summary and not st.session_state.summary_error:
-        with st.spinner("Generating executive summary with Gemini..."):
+        with st.spinner("Generating executive summary with OpenRouter..."):
             try:
-                st.session_state.summary = call_gemini(model, build_summary_prompt(document))
+                st.session_state.summary = call_openrouter(api_key, build_summary_prompt(document))
             except Exception as exc:
                 st.session_state.summary_error = str(exc)
 
@@ -572,9 +641,9 @@ def render_summary_tab(model: genai.GenerativeModel | None, document: PdfDocumen
             st.rerun()
         return
 
-    st.markdown('<div class="summary-panel">', unsafe_allow_html=True)
+    render_html('<div class="summary-panel">')
     st.markdown(st.session_state.summary)
-    st.markdown("</div>", unsafe_allow_html=True)
+    render_html("</div>")
 
     col_a, col_b = st.columns([1, 3])
     with col_a:
@@ -592,8 +661,8 @@ def render_summary_tab(model: genai.GenerativeModel | None, document: PdfDocumen
         )
 
 
-def handle_chat_question(model: genai.GenerativeModel, document: PdfDocument, question: str) -> None:
-    """Append a user question and Gemini answer to chat history."""
+def handle_chat_question(api_key: str, document: PdfDocument, question: str) -> None:
+    """Append a user question and OpenRouter answer to chat history."""
 
     clean_question = question.strip()
     if not clean_question:
@@ -602,13 +671,13 @@ def handle_chat_question(model: genai.GenerativeModel, document: PdfDocument, qu
     st.session_state.messages.append({"role": "user", "content": clean_question})
     with st.spinner("Thinking through the PDF..."):
         try:
-            answer = call_gemini(model, build_chat_prompt(document, st.session_state.messages, clean_question))
+            answer = call_openrouter(api_key, build_chat_prompt(document, st.session_state.messages, clean_question))
         except Exception as exc:
             answer = f"I could not complete that request. {exc}"
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
-def render_quick_actions(model: genai.GenerativeModel | None, document: PdfDocument | None) -> None:
+def render_quick_actions(api_key: str | None, document: PdfDocument | None) -> None:
     """Render quick prompt buttons for common analysis tasks."""
 
     actions = [
@@ -617,26 +686,26 @@ def render_quick_actions(model: genai.GenerativeModel | None, document: PdfDocum
         "List key risks",
         "Find action items",
     ]
-    st.markdown('<div class="quick-actions">', unsafe_allow_html=True)
+    render_html('<div class="quick-actions">')
     columns = st.columns(len(actions))
     for column, action in zip(columns, actions):
         with column:
-            if st.button(action, use_container_width=True, disabled=model is None or document is None):
-                assert model is not None and document is not None
-                handle_chat_question(model, document, action)
+            if st.button(action, use_container_width=True, disabled=api_key is None or document is None):
+                assert api_key is not None and document is not None
+                handle_chat_question(api_key, document, action)
                 st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+    render_html("</div>")
 
 
-def render_chat_tab(model: genai.GenerativeModel | None, document: PdfDocument | None) -> None:
+def render_chat_tab(api_key: str | None, document: PdfDocument | None) -> None:
     """Render the conversational PDF agent tab."""
 
     if document is None:
         render_empty_state()
         return
 
-    if model is None:
-        st.warning("Add `GEMINI_API_KEY` in Streamlit secrets to chat with the PDF.")
+    if api_key is None:
+        st.warning("Add `OPENROUTER_API_KEY` in Streamlit secrets to chat with the PDF.")
         return
 
     for message in st.session_state.messages:
@@ -650,11 +719,11 @@ def render_chat_tab(model: genai.GenerativeModel | None, document: PdfDocument |
                 "financial figures, or a simpler explanation of any section."
             )
 
-    render_quick_actions(model, document)
+    render_quick_actions(api_key, document)
 
     question = st.chat_input("Ask a question about this PDF...")
     if question:
-        handle_chat_question(model, document, question)
+        handle_chat_question(api_key, document, question)
         st.rerun()
 
 
@@ -670,8 +739,7 @@ def main() -> None:
     init_state()
     inject_css()
 
-    api_key = get_gemini_api_key()
-    model = configure_gemini(api_key) if api_key else None
+    api_key = get_openrouter_api_key()
 
     render_sidebar(api_key)
     render_header()
@@ -679,9 +747,9 @@ def main() -> None:
     document: PdfDocument | None = st.session_state.document
     tab_summary, tab_chat = st.tabs(["📊 Executive Summary", "💬 Chat with PDF Agent"])
     with tab_summary:
-        render_summary_tab(model, document)
+        render_summary_tab(api_key, document)
     with tab_chat:
-        render_chat_tab(model, document)
+        render_chat_tab(api_key, document)
 
 
 if __name__ == "__main__":
